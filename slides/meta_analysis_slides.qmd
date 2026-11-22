@@ -1,0 +1,550 @@
+---
+title: "Meta-analysis in R"
+subtitle: "A worked example: BCG vaccine and tuberculosis (13 RCTs)"
+author: "Dr Gurpreet"
+date: today
+format:
+  revealjs:
+    theme: [default, slides.scss]
+    slide-number: true
+    transition: fade
+    transition-speed: fast
+    embed-resources: true
+    width: 1280
+    height: 720
+    margin: 0.06
+    fig-align: center
+    fig-dpi: 150
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+library(metafor)
+library(tidyverse)
+library(knitr)
+
+theme_set(theme_minimal(base_size = 14))
+
+tidy_mf <- \(x) x |>
+  as.data.frame() |>
+  as_tibble() |>
+  rename_with(\(nm) str_replace_all(nm, "\\.", "_"))
+
+f2  <- \(x) format(round(x, 2), nsmall = 2)
+ci  <- \(est, lo, hi) str_glue("{f2(est)} ({f2(lo)} to {f2(hi)})")
+
+# Data -------------------------------------------------------------------
+bcg <- dat.bcg |>
+  as_tibble() |>
+  mutate(
+    study  = str_c(author, ", ", year),
+    n_vacc = tpos + tneg,
+    n_ctrl = cpos + cneg
+  )
+
+bcg_es <- escalc(measure = "RR", ai = tpos, bi = tneg, ci = cpos, di = cneg,
+                 data = bcg, slab = study)
+
+# Models -----------------------------------------------------------------
+res_fe <- rma(yi, vi, data = bcg_es, method = "EE")
+res_re <- rma(yi, vi, data = bcg_es, method = "REML")
+res_mr <- rma(yi, vi, mods = ~ ablat, data = bcg_es, method = "REML")
+egger  <- regtest(res_re, model = "lm", predictor = "sei")
+begg   <- ranktest(res_re)
+res_tf <- trimfill(res_re)
+inf_re <- influence(res_re)
+het_ci <- confint(res_re)
+
+pooled <- bind_rows(
+  `Common effect`  = predict(res_fe, transf = exp) |> tidy_mf(),
+  `Random effects` = predict(res_re, transf = exp) |> tidy_mf(),
+  .id = "model"
+)
+re <- pooled |> filter(model == "Random effects")
+
+wts <- tibble(study = bcg$study, w_fe = weights(res_fe), w_re = weights(res_re))
+w_madras <- wts |> filter(str_detect(study, "Madras"))
+
+loo <- leave1out(res_re, transf = exp) |>
+  tidy_mf() |>
+  mutate(omitted = bcg$study) |>
+  select(omitted, rr = estimate, ci_lb, ci_ub, I2, tau2)
+loo_of <- \(pat) loo |> filter(str_detect(omitted, pat))
+```
+
+# The question and the data {background-color="#1f3b57"}
+
+## The data: 13 trials of BCG vaccine
+
+```{r}
+#| label: data
+bcg |>
+  transmute(
+    Study = study,
+    `Latitude (°)` = ablat,
+    Allocation = str_to_sentence(alloc),
+    `Vaccinated: TB / N` = str_glue("{tpos} / {format(n_vacc, big.mark = ',')}"),
+    `Control: TB / N`    = str_glue("{cpos} / {format(n_ctrl, big.mark = ',')}")
+  ) |>
+  kable(align = "lrlrr")
+```
+
+::: {.fragment .fade-up .explain-bar}
+**PICO:** Population = people in 13 trial settings · Intervention = BCG · Comparator = no vaccine · Outcome = TB cases. Trial sizes range from `r format(min(bcg$n_vacc + bcg$n_ctrl), big.mark = ",")` to `r format(max(bcg$n_vacc + bcg$n_ctrl), big.mark = ",")` participants, and sites span `r min(bcg$ablat)`° to `r max(bcg$ablat)`° latitude.
+:::
+
+## Step 1: Effect size for each trial
+
+:::: {.columns}
+::: {.column width="55%"}
+```{r}
+#| label: es
+bcg_es |>
+  as_tibble() |>
+  mutate(
+    RR = exp(yi),
+    `95% CI` = str_glue("{f2(exp(yi - 1.96 * sqrt(vi)))} to {f2(exp(yi + 1.96 * sqrt(vi)))}")
+  ) |>
+  transmute(Study = study, RR = f2(RR), `95% CI`) |>
+  kable(align = "lrr")
+```
+:::
+
+::: {.column width="45%"}
+::: {.fragment .fade-left .explain}
+**How to read**
+
+Risk ratio (RR) = risk of TB in vaccinated ÷ risk in controls. RR < 1 means the vaccine protects. We analyse **log RR** and back-transform for display.
+:::
+
+::: {.fragment .fade-left .explain}
+**What we infer**
+
+RRs range from `r f2(min(exp(bcg_es$yi)))` to `r f2(max(exp(bcg_es$yi)))`. Most trials favour BCG, but by very different amounts: the first hint of **heterogeneity**.
+:::
+:::
+::::
+
+# Pooling the trials {background-color="#1f3b57"}
+
+## Step 2: Common-effect vs random-effects
+
+```{r}
+#| label: pooled
+pooled |>
+  transmute(
+    Model = model,
+    `Pooled RR (95% CI)` = ci(pred, ci_lb, ci_ub),
+    `95% prediction interval` = if_else(is.na(pi_lb), "—",
+                                        str_glue("{f2(pi_lb)} to {f2(pi_ub)}"))
+  ) |>
+  kable(align = "lcc")
+```
+
+:::: {.columns}
+::: {.column width="50%"}
+::: {.fragment .fade-up .explain}
+**How to read**
+
+*Common effect* assumes all trials estimate one true RR. *Random effects* assumes true RRs vary between settings and estimates their **average**. The prediction interval is where a **new** trial's true RR is likely to fall.
+:::
+:::
+
+::: {.column width="50%"}
+::: {.fragment .fade-up .explain}
+**What we infer**
+
+BCG reduces TB risk by about **`r round(100 * (1 - re$pred))`%** on average (RR `r f2(re$pred)`). The common-effect CI is falsely narrow because it ignores between-trial variation. The prediction interval (`r f2(re$pi_lb)` to `r f2(re$pi_ub)`) **crosses 1**.
+:::
+:::
+::::
+
+## Step 3: Forest plot
+
+:::: {.columns}
+::: {.column width="64%"}
+```{r}
+#| label: forest
+#| fig-width: 9.5
+#| fig-height: 6.6
+par(mar = c(4, 0, 1, 0))
+forest(
+  res_re,
+  atransf   = exp,
+  at        = log(c(0.05, 0.25, 1, 4)),
+  xlim      = c(-16, 6),
+  ilab      = cbind(bcg$tpos, bcg$n_vacc, bcg$cpos, bcg$n_ctrl),
+  ilab.xpos = c(-9.5, -8, -6, -4.5),
+  header    = c("Study", "RR [95% CI]"),
+  addpred   = TRUE,
+  shade     = TRUE,
+  mlab      = "Random-effects model"
+)
+text(c(-9.5, -8, -6, -4.5), res_re$k + 2, c("TB+", "N", "TB+", "N"), font = 2, cex = 0.8)
+text(c(-8.75, -5.25),       res_re$k + 3, c("Vaccinated", "Control"), font = 2, cex = 0.8)
+```
+:::
+
+::: {.column width="36%"}
+::: {.fragment .fade-left .explain}
+**Square** = trial's RR, size = weight. **Line** = its 95% CI.
+:::
+
+::: {.fragment .fade-left .explain}
+**Vertical line at 1** = no effect. Left favours BCG.
+:::
+
+::: {.fragment .fade-left .explain}
+**Diamond** = pooled RR and CI. **Dotted line** = prediction interval.
+:::
+
+::: {.fragment .fade-left .explain}
+**x-axis is log scale:** 0.5 and 2 are equally far from 1.
+:::
+:::
+::::
+
+## Forest plot: what we infer
+
+:::: {.columns}
+::: {.column width="64%"}
+```{r}
+#| label: forest-2
+#| fig-width: 9.5
+#| fig-height: 6.6
+par(mar = c(4, 0, 1, 0))
+forest(res_re, atransf = exp, at = log(c(0.05, 0.25, 1, 4)), xlim = c(-10, 6),
+       header = c("Study", "RR [95% CI]"), addpred = TRUE, shade = TRUE,
+       mlab = "Random-effects model")
+```
+:::
+
+::: {.column width="36%"}
+::: {.fragment .fade-left .explain}
+**Direction:** `r res_re$k - 2` of `r res_re$k` trials favour BCG.
+:::
+
+::: {.fragment .fade-left .explain}
+**Precision:** several trials are non-significant alone, yet the pooled RR `r ci(re$pred, re$ci_lb, re$ci_ub)` is clearly below 1.
+:::
+
+::: {.fragment .fade-left .explain}
+**Heterogeneity by eye:** CIs often do not overlap (Hart & Sutherland 0.24 vs TPT Madras 1.01).
+:::
+
+::: {.fragment .fade-left .explain}
+**Weights are even** (`r round(min(wts$w_re))`–`r round(max(wts$w_re))`%). Under common effect, TPT Madras alone would take `r round(w_madras$w_fe)`%.
+:::
+:::
+::::
+
+# Heterogeneity {background-color="#1f3b57"}
+
+## Step 4: How much do the trials disagree?
+
+:::: {.columns}
+::: {.column width="50%"}
+```{r}
+#| label: het
+het_ci$random |>
+  as.data.frame() |>
+  rownames_to_column("stat") |>
+  as_tibble() |>
+  mutate(
+    Statistic = recode(stat, `tau^2` = "τ²", tau = "τ", `I^2(%)` = "I² (%)", `H^2` = "H²"),
+    Estimate  = f2(estimate),
+    `95% CI`  = str_glue("{f2(ci.lb)} to {f2(ci.ub)}")
+  ) |>
+  select(Statistic, Estimate, `95% CI`) |>
+  add_row(Statistic = "Cochran's Q (df = 12)", Estimate = f2(res_re$QE),
+          `95% CI` = "p < 0.0001", .before = 1) |>
+  kable(align = "lrr")
+```
+:::
+
+::: {.column width="50%"}
+::: {.fragment .fade-left .explain}
+**How to read**
+
+**Q** tests "all trials share one effect". **I²** = share of variability due to real differences (a proportion). **τ²** = between-trial variance on the log RR scale (an absolute amount).
+:::
+
+::: {.fragment .fade-left .explain}
+**What we infer**
+
+I² = **`r round(res_re$I2)`%**: almost all the spread is real, not chance. Even the lower CI bound (`r round(het_ci$random[3, 2])`%) is high. Pooling is still fine, but we must **explain** the heterogeneity.
+:::
+:::
+::::
+
+## Step 5: Meta-regression on latitude
+
+:::: {.columns}
+::: {.column width="58%"}
+```{r}
+#| label: bubble
+#| fig-width: 7
+#| fig-height: 5.6
+lat_grid <- tibble(ablat = seq(10, 60, by = 1))
+
+lat_pred <- predict(res_mr, newmods = lat_grid$ablat, transf = exp) |>
+  tidy_mf() |>
+  bind_cols(lat_grid)
+
+bcg_es |>
+  as_tibble() |>
+  mutate(rr = exp(yi), weight = 1 / vi) |>
+  ggplot(aes(ablat, rr)) +
+  geom_ribbon(data = lat_pred, aes(y = pred, ymin = ci_lb, ymax = ci_ub),
+              fill = "grey85") +
+  geom_line(data = lat_pred, aes(y = pred), linewidth = 0.9) +
+  geom_point(aes(size = weight), shape = 21, fill = "#2b6c9e", alpha = 0.75) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  scale_y_log10() +
+  scale_size_area(max_size = 14, guide = "none") +
+  labs(x = "Absolute latitude (degrees)", y = "Risk ratio (log scale)")
+```
+:::
+
+::: {.column width="42%"}
+::: {.fragment .fade-left .explain}
+**How to read**
+
+Bubble = trial (size = weight). Line and band = fitted relation and its 95% CI. Dashed line = no effect. A **slope** means the moderator explains heterogeneity.
+:::
+
+::: {.fragment .fade-left .explain}
+**What we infer**
+
+Each degree from the equator multiplies RR by `r f2(exp(res_mr$b[2]))`. Little effect near the equator; strong protection above 50°. Latitude explains **`r round(res_mr$R2)`%** of τ²; I² falls from `r round(res_re$I2)`% to `r round(res_mr$I2)`%.
+:::
+
+::: {.fragment .fade-left .explain .caution}
+Across-study (ecological) association. Latitude is a proxy, e.g. for exposure to environmental mycobacteria.
+:::
+:::
+::::
+
+# Small-study effects {background-color="#1f3b57"}
+
+## Step 6: Funnel plots
+
+```{r}
+#| label: funnel
+#| fig-width: 12
+#| fig-height: 4.3
+par(mfrow = c(1, 2), mar = c(4.5, 4.5, 2, 1))
+funnel(res_re, atransf = exp, xlab = "Risk ratio (log scale)", main = "Standard")
+funnel(res_re, level = c(90, 95, 99), shade = c("white", "grey80", "grey60"),
+       refline = 0, legend = TRUE, atransf = exp,
+       xlab = "Risk ratio (log scale)", main = "Contour-enhanced")
+```
+
+:::: {.columns}
+::: {.column width="50%"}
+::: {.fragment .fade-up .explain}
+**How to read:** effect (x) vs standard error (y, inverted: big trials at top). Expect a symmetric funnel; a gap in a bottom corner suggests missing small trials. Grey zones = statistically significant results.
+:::
+:::
+
+::: {.column width="50%"}
+::: {.fragment .fade-up .explain}
+**What we infer:** large trials are spread widely (heterogeneity, not bias). Small trials sit in both shaded and white zones, so only a mild hint of asymmetry and no clear sign of missing null trials.
+:::
+:::
+::::
+
+## Step 7: Egger's test and trim-and-fill
+
+:::: {.columns}
+::: {.column width="50%"}
+```{r}
+#| label: bias
+tibble(
+  Test = c("Egger's regression", "Begg's rank correlation",
+           "Trim-and-fill: studies imputed", "Trim-and-fill: adjusted RR"),
+  Result = c(
+    str_glue("t = {f2(egger$zval)}, p = {f2(egger$pval)}"),
+    str_glue("Kendall's τ = {f2(begg$tau)}, p = {f2(begg$pval)}"),
+    str_glue("{res_tf$k0} ({res_tf$side} side)"),
+    ci(exp(res_tf$b[1]), exp(res_tf$ci.lb), exp(res_tf$ci.ub))
+  )
+) |>
+  kable(align = "lr")
+```
+
+::: {.fragment .fade-up .explain}
+**How to read:** Egger tests whether small trials give systematically different results. Trim-and-fill imputes "missing" trials (open circles) and re-pools.
+:::
+
+::: {.fragment .fade-up .explain .caution}
+Use these tests only with ≥ 10 studies. Asymmetry ≠ publication bias: heterogeneity alone can distort a funnel.
+:::
+:::
+
+::: {.column width="50%"}
+```{r}
+#| label: trimfill
+#| fig-width: 6
+#| fig-height: 4.2
+par(mar = c(4.5, 4.5, 1, 1))
+funnel(res_tf, atransf = exp, legend = TRUE, xlab = "Risk ratio (log scale)")
+```
+
+::: {.fragment .fade-up .explain}
+**What we infer:** no strong evidence of small-study effects. Adjusting moves RR only from `r f2(re$pred)` to `r f2(exp(res_tf$b[1]))`.
+:::
+:::
+::::
+
+
+# Sensitivity analysis {background-color="#1f3b57"}
+
+## Step 8: Leave-one-out
+
+:::: {.columns}
+::: {.column width="60%"}
+```{r}
+#| label: loo
+#| fig-width: 7.6
+#| fig-height: 6.2
+loo |>
+  mutate(omitted = fct_reorder(omitted, rr)) |>
+  ggplot(aes(rr, omitted)) +
+  annotate("rect", xmin = re$ci_lb, xmax = re$ci_ub,
+           ymin = -Inf, ymax = Inf, fill = "grey90") +
+  geom_vline(xintercept = re$pred, linetype = "dashed") +
+  geom_vline(xintercept = 1, colour = "firebrick") +
+  geom_pointrange(aes(xmin = ci_lb, xmax = ci_ub)) +
+  geom_text(aes(x = ci_ub, label = str_c("I² = ", round(I2), "%")),
+            hjust = -0.15, size = 3.4, colour = "grey30") +
+  scale_x_log10(breaks = c(0.3, 0.4, 0.5, 0.7, 1),
+                expand = expansion(mult = c(0.05, 0.25))) +
+  labs(x = "Pooled RR with study omitted (log scale)", y = NULL)
+```
+:::
+
+::: {.column width="40%"}
+::: {.fragment .fade-left .explain}
+**How to read**
+
+Each row = re-analysis without that trial. Dashed line and band = original RR and CI. Red line = no effect. Labels = I² after removal.
+:::
+
+::: {.fragment .fade-left .explain}
+**What we infer**
+
+RR stays between **`r f2(min(loo$rr))` and `r f2(max(loo$rr))`**; no CI crosses 1. **Robust.** Dropping TPT Madras gives `r f2(loo_of("Madras")$rr)` (I² `r round(loo_of("Madras")$I2)`%); dropping Hart & Sutherland gives `r f2(loo_of("Hart")$rr)`.
+:::
+
+::: {.fragment .fade-left .explain}
+I² stays above 85% whatever is removed: heterogeneity is **not one outlier**.
+:::
+:::
+::::
+
+## Step 9: Influence diagnostics
+
+:::: {.columns}
+::: {.column width="60%"}
+```{r}
+#| label: influence
+#| fig-width: 8
+#| fig-height: 6.4
+plot(inf_re)
+```
+:::
+
+::: {.column width="40%"}
+::: {.fragment .fade-left .explain}
+**How to read**
+
+One dot per trial. **rstudent** beyond ±2 = outlier. **cook.d / dffits** = shift in pooled result if removed. **QE.del** = Q after removal. **Red** = flagged as influential.
+:::
+
+::: {.fragment .fade-left .explain}
+**What we infer**
+
+**`r sum(inf_re$is.infl)` trials flagged.** Hart & Sutherland (Cook's d `r f2(inf_re$inf$cook.d[4])`) and TPT Madras (`r f2(inf_re$inf$cook.d[8])`) matter most; removing them cuts Q from `r round(res_re$QE)` to `r round(inf_re$inf$QE.del[4])` and `r round(inf_re$inf$QE.del[8])`.
+:::
+:::
+::::
+
+## Step 10: Baujat plot
+
+:::: {.columns}
+::: {.column width="58%"}
+```{r}
+#| label: baujat
+#| fig-width: 7
+#| fig-height: 5.6
+par(mar = c(4.5, 4.5, 1, 1))
+baujat(res_re)
+```
+:::
+
+::: {.column width="42%"}
+::: {.fragment .fade-left .explain}
+**How to read**
+
+x = contribution to heterogeneity. y = influence on the pooled result. **Top-right** trials do both and deserve a closer look.
+:::
+
+::: {.fragment .fade-left .explain}
+**What we infer**
+
+Trials 4 (Hart & Sutherland, 52°) and 8 (TPT Madras, 13°) sit top-right, at **opposite latitudes**: the same story as the meta-regression.
+:::
+:::
+::::
+
+# Summary {background-color="#1f3b57"}
+
+## Results at a glance {.bigtable}
+
+```{r}
+#| label: summary
+tibble(
+  Item = c("Trials (k)", "Pooled RR, random effects (95% CI)", "95% prediction interval",
+           "I²", "τ²", "Latitude: R² of meta-regression", "Egger's test p",
+           "Leave-one-out RR range"),
+  Result = c(
+    res_re$k,
+    ci(re$pred, re$ci_lb, re$ci_ub),
+    str_glue("{f2(re$pi_lb)} to {f2(re$pi_ub)}"),
+    str_c(round(res_re$I2), "%"),
+    f2(res_re$tau2),
+    str_c(round(res_mr$R2), "%"),
+    f2(egger$pval),
+    str_glue("{f2(min(loo$rr))} to {f2(max(loo$rr))}")
+  )
+) |>
+  kable(align = "lr")
+```
+
+## Take-home messages {.takehome}
+
+::: {.fragment .fade-up .explain}
+**1.** BCG reduces TB risk by about **half** on average (RR `r f2(re$pred)`).
+:::
+
+::: {.fragment .fade-up .explain}
+**2.** Heterogeneity is **very high** (I² `r round(res_re$I2)`%). Always report the **prediction interval**, not only the CI.
+:::
+
+::: {.fragment .fade-up .explain}
+**3.** Look for **why** trials differ: latitude explains about three-quarters of it.
+:::
+
+::: {.fragment .fade-up .explain}
+**4.** Funnel asymmetry ≠ publication bias. Here there is no strong evidence of small-study effects.
+:::
+
+::: {.fragment .fade-up .explain}
+**5.** Sensitivity analyses show the conclusion does **not** rest on any single trial.
+:::

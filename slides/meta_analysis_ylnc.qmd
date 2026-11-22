@@ -1,0 +1,871 @@
+---
+title: "Meta-Analysis: When and How"
+subtitle: "From a pile of studies to one honest answer"
+author: "Department of Community Medicine, AFMC Pune"
+date: today
+date-format: "D MMMM YYYY"
+format:
+  revealjs:
+    theme: [default, ylnc.scss]
+    slide-number: c/t
+    progress: true
+    hash: true
+    transition: fade
+    width: 1280
+    height: 720
+    margin: 0.06
+    code-overflow: wrap
+    code-line-numbers: false
+    highlight-style: github
+    embed-resources: true
+    footer: "Meta-analysis · YLNC"
+execute:
+  echo: false
+  warning: false
+  message: false
+knitr:
+  opts_chunk:
+    dev: "png"
+    dpi: 160
+    fig.align: "center"
+---
+
+```{r}
+#| label: setup
+library(tidyverse)
+library(metafor)
+library(patchwork)
+
+# one palette for the whole deck
+pal <- c(navy = "#12355B", rust = "#C8553D", teal = "#1F6F8B",
+         sand = "#E9C46A", grey = "#6B7785", soft = "#EEF3F7")
+
+theme_ylnc <- function(base_size = 16) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      panel.grid.minor = element_blank(),
+      panel.grid.major.y = element_blank(),
+      plot.title = element_text(face = "bold", colour = pal[["navy"]]),
+      plot.subtitle = element_text(colour = pal[["grey"]]),
+      axis.title = element_text(colour = pal[["grey"]]),
+      legend.position = "top"
+    )
+}
+theme_set(theme_ylnc())
+
+# ---- Example data: BCG vaccine trials (Colditz et al. 1994; ships with metafor) ----
+bcg <- dat.bcg |>
+  as_tibble() |>
+  mutate(study = str_glue("{author} ({year})") |> as.character())
+
+# effect sizes: log risk ratio and its sampling variance, per study
+bcg_es <- bcg |>
+  mutate(
+    # log RR = log( (a/(a+b)) / (c/(c+d)) )
+    yi  = log((tpos / (tpos + tneg)) / (cpos / (cpos + cneg))),
+    vi  = 1 / tpos - 1 / (tpos + tneg) + 1 / cpos - 1 / (cpos + cneg),
+    sei = sqrt(vi),
+    lo  = yi - 1.96 * sei,
+    hi  = yi + 1.96 * sei
+  )
+
+fe <- rma(yi, vi, data = bcg_es, method = "FE")
+re <- rma(yi, vi, data = bcg_es, method = "REML")
+re_dl <- rma(yi, vi, data = bcg_es, method = "DL")
+re_hk <- rma(yi, vi, data = bcg_es, method = "REML", test = "knha")
+re_pred <- predict(re, transf = exp)
+
+fmt <- function(x, d = 2) formatC(x, format = "f", digits = d)
+```
+
+## Today's plan
+
+:::: {.columns}
+::: {.column width="50%"}
+1. Why pool at all?
+2. When **not** to do a meta-analysis
+3. The workflow: question to extraction
+4. Effect measures
+5. Fixed vs random effects
+:::
+::: {.column width="50%"}
+6. Heterogeneity
+7. Reading a forest plot
+8. Subgroups and meta-regression
+9. Small-study effects and funnel plots
+10. Certainty of evidence (GRADE)
+11. Doing it in R
+:::
+::::
+
+::: {.keybox}
+One running example throughout: **13 trials of BCG vaccine for preventing tuberculosis.**
+:::
+
+# Why meta-analysis? {background-color="#12355B" .divider}
+
+## What is a meta-analysis?
+
+- A **reproducible** method to answer a research question by collecting **all** available studies on it
+- Uses **statistical techniques** to combine the results of individual studies
+- Draws **new conclusions** from the pooled data
+
+::: {.keybox}
+**Systematic review** = the whole process (question, search, appraisal, synthesis).<br>
+**Meta-analysis** = the optional *statistical* step inside it.
+:::
+
+::: {.small .muted}
+Every meta-analysis should sit inside a systematic review. Not every systematic review needs a meta-analysis.
+:::
+
+## Why combine studies?
+
+:::: {.columns}
+::: {.column width="55%"}
+- **Precision:** many small trials, each underpowered, together give a narrow CI
+- **Consistency:** does the effect hold across settings, populations, doses?
+- **Conflict resolution:** "positive" and "negative" trials can agree once pooled
+- **New questions:** explore *why* results differ (subgroups, meta-regression)
+:::
+::: {.column width="45%"}
+```{r}
+#| label: figx-precision
+#| fig-width: 5.5
+#| fig-height: 4.6
+set.seed(42)
+tibble(k = 1:12) |>
+  mutate(
+    n_cum = cumsum(rep(120, 12)),
+    se    = sqrt(4 / n_cum)
+  ) |>
+  ggplot(aes(k, 1.96 * se)) +
+  geom_line(colour = pal[["teal"]], linewidth = 1.2) +
+  geom_point(colour = pal[["teal"]], size = 3) +
+  scale_x_continuous(breaks = c(1, 4, 8, 12)) +
+  labs(
+    x = "Number of similar studies pooled",
+    y = "Half-width of 95% CI",
+    title = "More studies, narrower interval",
+    subtitle = "Each study n = 120"
+  )
+```
+:::
+::::
+
+## When **not** to meta-analyse
+
+- Studies answer **different questions** (apples and oranges)
+- Outcomes are measured in ways that **can't be put on one scale**
+- Studies are at **high risk of bias** (garbage in, garbage out)
+- **Very large, unexplained heterogeneity**: a single number would mislead
+- **Selective reporting** has removed much of the evidence
+
+::: {.keybox}
+A precise pooled estimate of **biased** studies is a precisely wrong answer.
+Narrative or structured synthesis (e.g. SWiM) is a legitimate alternative.
+:::
+
+# The workflow {background-color="#12355B" .divider}
+
+## From question to pooled estimate
+
+```{r}
+#| label: figx-workflow
+#| fig-width: 12
+#| fig-height: 3.6
+steps <- tibble(
+  step = c("Question\n(PICO)", "Write\nprotocol", "Search", "Screen &\nselect",
+           "Extract\ndata", "Risk of\nbias", "Meta-\nanalysis", "Certainty\n(GRADE)"),
+  x = seq_along(step),
+  stat = x == 7
+)
+
+steps |>
+  ggplot(aes(x, 1)) +
+  geom_segment(aes(x = x + 0.42, xend = x + 0.58, y = 1, yend = 1),
+               data = filter(steps, x < max(x)),
+               arrow = arrow(length = unit(0.18, "cm"), type = "closed"),
+               colour = pal[["grey"]]) +
+  geom_tile(aes(fill = stat), width = 0.86, height = 0.8, colour = NA) +
+  geom_text(aes(label = step, colour = stat), size = 5.2, lineheight = 0.9, fontface = "bold") +
+  scale_fill_manual(values = c(`FALSE` = pal[["soft"]], `TRUE` = pal[["rust"]]), guide = "none") +
+  scale_colour_manual(values = c(`FALSE` = pal[["navy"]], `TRUE` = "white"), guide = "none") +
+  coord_cartesian(xlim = c(0.5, 8.5), ylim = c(0.5, 1.5)) +
+  theme_void()
+```
+
+::: {.small}
+- Register the protocol (PROSPERO) **before** you see the results
+- Report with **PRISMA 2020**: flow diagram, checklist, and the full search strategy
+:::
+
+## Collecting data: what to abstract
+
+| Category | Columns |
+|---|---|
+| Study info | Study ID, author, year, country, design |
+| Population | Description, age (mean/range), sex (%) |
+| Sample size | n intervention, n control |
+| Intervention | Name & dose, comparator, follow-up |
+| Outcome data | Events/totals, or mean & SD per arm |
+| Effect estimates | Effect size, 95% CI, p-value |
+| Quality | Risk of bias, conflicts of interest, funding |
+
+::: {.small .muted}
+Pilot the form on 2–3 studies, extract in **duplicate**, and write to investigators for missing data.
+:::
+
+## Keep the data tidy
+
+One row per study, one column per variable. This is what our BCG data look like:
+
+```{r}
+#| label: tblx-bcg
+bcg |>
+  select(study, tpos, tneg, cpos, cneg, ablat, alloc) |>
+  slice_head(n = 7) |>
+  knitr::kable(
+    col.names = c("Study", "TB (vacc.)", "No TB (vacc.)", "TB (ctrl)", "No TB (ctrl)",
+                  "Latitude", "Allocation"),
+    align = "lrrrrrl"
+  )
+```
+
+::: {.small .muted}
+… 13 trials in all. `dat.bcg` ships with the **metafor** package (Colditz et al., *JAMA* 1994).
+:::
+
+## Risk of bias comes before pooling
+
+:::: {.columns}
+::: {.column width="50%"}
+**Within studies (RoB 2 / ROBINS-I)**
+
+- Randomisation & allocation concealment
+- Deviations from intended intervention
+- Missing outcome data
+- Measurement of the outcome
+- Selective reporting
+:::
+::: {.column width="50%"}
+**Across studies (reporting biases)**
+
+- Publication bias
+- Time-lag bias
+- Language bias
+- Citation bias
+- Duplicate publication
+- Location bias
+:::
+::::
+
+::: {.keybox}
+Use RoB judgements in the analysis: sensitivity analysis excluding high-risk studies, or subgroup by RoB.
+:::
+
+# Effect measures {background-color="#12355B" .divider}
+
+## Choosing an effect measure
+
+| Outcome type | Common measures | Example |
+|---|---|---|
+| Dichotomous | **Risk ratio**, odds ratio, risk difference | TB yes/no |
+| Continuous, same scale | **Mean difference (MD)** | SBP in mmHg |
+| Continuous, different scales | **Standardised MD** (Hedges' *g*) | Depression scores |
+| Time to event | **Hazard ratio** | Survival |
+| Counts & rates | Rate ratio | Falls per person-year |
+
+::: {.small}
+Ratio measures are pooled on the **log scale** and back-transformed for presentation.
+:::
+
+## Computing a study's effect: the 2 × 2 table
+
+:::: {.columns}
+::: {.column width="45%"}
+|  | Event | No event |
+|---|---|---|
+| **Vaccine** | *a* | *b* |
+| **Control** | *c* | *d* |
+
+$$
+\text{RR} = \frac{a/(a+b)}{c/(c+d)}
+$$
+
+$$
+\operatorname{Var}(\ln \text{RR}) = \tfrac{1}{a} - \tfrac{1}{a+b} + \tfrac{1}{c} - \tfrac{1}{c+d}
+$$
+:::
+::: {.column width="55%"}
+```{r}
+#| label: code-es
+#| echo: true
+#| eval: false
+bcg_es <- bcg |>
+  mutate(
+    yi  = log((tpos / (tpos + tneg)) /
+              (cpos / (cpos + cneg))),
+    vi  = 1/tpos - 1/(tpos + tneg) +
+          1/cpos - 1/(cpos + cneg),
+    sei = sqrt(vi)
+  )
+
+# or let metafor do it:
+escalc(measure = "RR",
+       ai = tpos, bi = tneg,
+       ci = cpos, di = cneg,
+       data = bcg)
+```
+:::
+::::
+
+# Pooling: fixed vs random effects {background-color="#12355B" .divider}
+
+## Meta-analysis is a two-stage process
+
+1. **Stage 1:** compute an effect estimate $y_i$ and its variance $v_i$ for **each study**
+2. **Stage 2:** combine them as a **weighted average**
+
+$$
+\hat\theta = \frac{\sum_i w_i \, y_i}{\sum_i w_i}, \qquad w_i = \frac{1}{v_i}
+\qquad \text{SE}(\hat\theta) = \frac{1}{\sqrt{\sum_i w_i}}
+$$
+
+::: {.keybox}
+**Inverse-variance weighting:** precise (usually larger) studies count for more.
+It is *not* a simple average and *not* pooling of raw patients.
+:::
+
+## Inverse-variance pooling by hand, the tidy way
+
+```{r}
+#| label: code-iv
+#| echo: true
+pooled_fe <- bcg_es |>
+  mutate(wi = 1 / vi) |>
+  summarise(
+    theta = sum(wi * yi) / sum(wi),
+    se    = sqrt(1 / sum(wi))
+  ) |>
+  mutate(
+    RR    = exp(theta),
+    lower = exp(theta - 1.96 * se),
+    upper = exp(theta + 1.96 * se)
+  )
+pooled_fe
+```
+
+::: {.small .muted}
+Identical to `rma(yi, vi, data = bcg_es, method = "FE")`: pooled RR = `r fmt(exp(coef(fe)))` (95% CI `r fmt(exp(fe$ci.lb))` to `r fmt(exp(fe$ci.ub))`).
+:::
+
+## Two models, two different questions
+
+:::: {.columns}
+::: {.column width="50%"}
+**Fixed (common) effect**
+
+- One true effect $\theta$ shared by all studies
+- Differences between studies = **sampling error only**
+- Answers: *"What is the best estimate of this common effect?"*
+- Methods: inverse variance, Mantel–Haenszel, Peto
+:::
+::: {.column width="50%"}
+**Random effects**
+
+- True effects **vary** across studies: $\theta_i \sim N(\mu, \tau^2)$
+- Two sources of variation: within ($v_i$) + between ($\tau^2$)
+- Answers: *"What is the **average** effect, and how much does it vary?"*
+- Weights: $w_i^* = 1 / (v_i + \tau^2)$
+:::
+::::
+
+::: {.keybox .small}
+Choose the model on **conceptual** grounds in your protocol, not after peeking at *I*².
+:::
+
+## Random effects spreads the weight
+
+```{r}
+#| label: figx-weights
+#| fig-width: 12
+#| fig-height: 5.2
+wts <- bcg_es |>
+  mutate(
+    `Fixed effect`   = weights(fe),
+    `Random effects` = weights(re)
+  ) |>
+  select(study, `Fixed effect`, `Random effects`) |>
+  pivot_longer(-study, names_to = "model", values_to = "weight") |>
+  mutate(study = fct_reorder(study, weight, .fun = max))
+
+wts |>
+  ggplot(aes(weight, study, fill = model)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.7) +
+  scale_fill_manual(values = c(pal[["grey"]], pal[["rust"]]), name = NULL) +
+  scale_x_continuous(labels = \(x) paste0(x, "%"), expand = expansion(mult = c(0, 0.05))) +
+  labs(x = "Weight in pooled estimate", y = NULL,
+       title = "Large trials dominate under fixed effect",
+       subtitle = str_glue("τ² = {fmt(re$tau2)}: smaller trials get a bigger say under random effects"))
+```
+
+## Estimating the between-study variance τ²
+
+| Estimator | Notes |
+|---|---|
+| DerSimonian–Laird (DL) | Classic, simple; underestimates τ² when *k* is small |
+| **REML** | Recommended default in most software today |
+| Paule–Mandel | Good alternative, also recommended |
+
+**Hartung–Knapp (HKSJ) adjustment** widens the CI to reflect uncertainty in τ², especially with few studies.
+
+```{r}
+#| label: tblx-estimators
+list(`DL` = re_dl, `REML` = re, `REML + HKSJ` = re_hk) |>
+  imap(\(m, nm) tibble(
+    Method = nm,
+    `Pooled RR` = fmt(exp(m$b[1])),
+    `95% CI` = str_glue("{fmt(exp(m$ci.lb))} to {fmt(exp(m$ci.ub))}"),
+    `τ²` = fmt(m$tau2, 3)
+  )) |>
+  list_rbind() |>
+  knitr::kable(align = "lccc")
+```
+
+# Heterogeneity {background-color="#12355B" .divider}
+
+## Is the variation more than chance?
+
+:::: {.columns}
+::: {.column width="50%"}
+- **Visual:** do the CIs overlap?
+- **Cochran's Q:** $Q = \sum w_i (y_i - \hat\theta)^2$, tests $H_0$: all studies share one effect. Low power with few studies.
+- ***I*²** $= \frac{Q - df}{Q}$: % of variability due to real differences, not chance
+- **τ²:** the *size* of the between-study variance, on the effect scale
+:::
+::: {.column width="50%"}
+| *I*² | Rough guide (Cochrane) |
+|---|---|
+| 0–40% | might not be important |
+| 30–60% | moderate |
+| 50–90% | substantial |
+| 75–100% | considerable |
+
+::: {.small}
+BCG: Q = `r fmt(re$QE, 1)` (df = `r re$k - 1`), *I*² = `r fmt(re$I2, 0)`%, τ² = `r fmt(re$tau2)`
+:::
+:::
+::::
+
+## Same pooled effect, very different stories
+
+```{r}
+#| label: figx-hetero
+#| fig-width: 12
+#| fig-height: 5.2
+set.seed(2025)
+sim_studies <- function(tau, label, k = 8) {
+  tibble(
+    study = str_c("Study ", 1:k),
+    sei   = runif(k, 0.12, 0.25),
+    yi    = rnorm(k, -0.4, tau) + rnorm(k, 0, sei),
+    scenario = label
+  )
+}
+
+sims <- bind_rows(
+  sim_studies(0.02, "Low heterogeneity"),
+  sim_studies(0.45, "High heterogeneity")
+) |>
+  mutate(scenario = fct_inorder(scenario))
+
+i2_lab <- sims |>
+  nest(.by = scenario) |>
+  mutate(
+    fit   = map(data, \(d) rma(yi, sei = sei, data = d)),
+    label = map_chr(fit, \(f) str_glue("I² = {fmt(f$I2, 0)}%"))
+  ) |>
+  select(scenario, label)
+
+sims |>
+  ggplot(aes(exp(yi), fct_rev(study))) +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = pal[["grey"]]) +
+  geom_vline(xintercept = exp(-0.4), colour = pal[["rust"]], alpha = 0.5) +
+  geom_errorbarh(aes(xmin = exp(yi - 1.96 * sei), xmax = exp(yi + 1.96 * sei)),
+                 height = 0, colour = pal[["navy"]]) +
+  geom_point(aes(size = 1 / sei^2), shape = 15, colour = pal[["navy"]]) +
+  geom_text(data = i2_lab, aes(x = 2.6, y = 8.4, label = label),
+            hjust = 1, size = 5.5, colour = pal[["rust"]], fontface = "bold") +
+  scale_x_log10(breaks = c(0.25, 0.5, 1, 2)) +
+  scale_size_continuous(range = c(1.5, 5), guide = "none") +
+  facet_wrap(~scenario) +
+  labs(x = "Risk ratio (log scale)", y = NULL) +
+  theme(strip.text = element_text(face = "bold", size = 16))
+```
+
+## Prediction interval: where the *next* study may land
+
+- The CI tells us about the **average** effect
+- The **95% prediction interval** tells us the range of true effects in a **new setting**
+
+::: {.keybox}
+BCG pooled RR = **`r fmt(re_pred$pred)`** (95% CI `r fmt(re_pred$ci.lb)` to `r fmt(re_pred$ci.ub)`)<br>
+95% prediction interval: **`r fmt(re_pred$pi.lb)` to `r fmt(re_pred$pi.ub)`**
+:::
+
+On average BCG protects, but in some settings it may do little or nothing.
+Report the prediction interval whenever you fit a random-effects model.
+
+# Reading a forest plot {background-color="#12355B" .divider}
+
+## The BCG forest plot
+
+```{r}
+#| label: figx-forest
+#| fig-width: 11
+#| fig-height: 6.2
+forest_df <- bcg_es |>
+  mutate(
+    weight = weights(re),
+    label  = str_glue("{fmt(exp(yi))} [{fmt(exp(lo))}, {fmt(exp(hi))}]"),
+    wlab   = str_glue("{fmt(weight, 1)}%")
+  ) |>
+  arrange(year) |>
+  mutate(row = rev(seq_len(n())) + 1)
+
+diamond <- tibble(
+  x = exp(c(re$ci.lb, re$b[1], re$ci.ub, re$b[1])),
+  y = c(0, 0.35, 0, -0.35)
+)
+pool_lab <- str_glue("{fmt(exp(re$b[1]))} [{fmt(exp(re$ci.lb))}, {fmt(exp(re$ci.ub))}]")
+
+forest_df |>
+  ggplot(aes(y = row)) +
+  geom_vline(xintercept = 1, colour = pal[["grey"]]) +
+  geom_vline(xintercept = exp(re$b[1]), colour = pal[["rust"]], linetype = "dotted") +
+  geom_segment(aes(x = exp(re_pred$pi.lb |> log()), xend = exp(re_pred$pi.ub |> log()),
+                   y = -0.9, yend = -0.9), colour = pal[["rust"]], linewidth = 1) +
+  geom_errorbarh(aes(xmin = exp(lo), xmax = exp(hi)), height = 0, colour = pal[["navy"]]) +
+  geom_point(aes(x = exp(yi), size = weight), shape = 15, colour = pal[["navy"]]) +
+  geom_polygon(data = diamond, aes(x, y), fill = pal[["rust"]]) +
+  # left text column: study names
+  geom_text(aes(x = 0.012, label = study), hjust = 0, size = 5) +
+  annotate("text", x = 0.012, y = 0, label = "Random effects (REML)", hjust = 0,
+           size = 5, fontface = "bold") +
+  annotate("text", x = 0.012, y = -0.9, label = "Prediction interval", hjust = 0,
+           size = 4.6, colour = pal[["rust"]]) +
+  # right text columns: RR [CI] and weight
+  geom_text(aes(x = 9, label = label), hjust = 0, size = 4.8) +
+  geom_text(aes(x = 45, label = wlab), hjust = 0, size = 4.8, colour = pal[["grey"]]) +
+  annotate("text", x = 9, y = 0, label = pool_lab, hjust = 0, size = 4.8, fontface = "bold") +
+  annotate("text", x = c(9, 45), y = max(forest_df$row) + 1.2,
+           label = c("RR [95% CI]", "Weight"), hjust = 0, fontface = "bold", size = 5) +
+  annotate("text", x = c(0.25, 4), y = -2, label = c("← Favours vaccine", "Favours control →"),
+           size = 4.8, colour = pal[["grey"]]) +
+  scale_x_log10(breaks = c(0.1, 0.25, 0.5, 1, 2, 4), labels = c("0.1", "0.25", "0.5", "1", "2", "4")) +
+  scale_size_continuous(range = c(1.5, 6), guide = "none") +
+  coord_cartesian(xlim = c(0.012, 90), ylim = c(-2.2, max(forest_df$row) + 1.4), clip = "off") +
+  labs(x = NULL, y = NULL) +
+  theme(axis.text.y = element_blank(), panel.grid = element_blank(),
+        axis.text.x = element_text(size = 12))
+```
+
+## Anatomy of a forest plot
+
+- **Square** = point estimate of each study; **size** ∝ weight
+- **Horizontal line** = 95% CI of that study
+- **Vertical line at 1** (ratio) or 0 (difference) = line of no effect
+- **Diamond** = pooled estimate; **width** = its 95% CI
+- **Prediction interval** = expected range of true effects in a new setting
+- Look for: direction, overlap of CIs, outliers, and the heterogeneity statistics
+
+::: {.keybox}
+Ask: *Do most studies point the same way? Is the diamond clear of the null? How wide is the spread?*
+:::
+
+# Explaining heterogeneity {background-color="#12355B" .divider}
+
+## Subgroup analysis
+
+```{r}
+#| label: figx-subgroup
+#| fig-width: 11
+#| fig-height: 4.2
+sub <- bcg_es |>
+  mutate(alloc = str_to_title(alloc)) |>
+  nest(.by = alloc) |>
+  mutate(
+    fit  = map(data, \(d) rma(yi, vi, data = d)),
+    k    = map_int(fit, \(f) f$k),
+    est  = map_dbl(fit, \(f) f$b[1]),
+    lo   = map_dbl(fit, \(f) f$ci.lb),
+    hi   = map_dbl(fit, \(f) f$ci.ub),
+    i2   = map_dbl(fit, \(f) f$I2)
+  )
+
+sub_test <- rma(yi, vi, mods = ~ alloc, data = bcg_es)
+
+sub |>
+  ggplot(aes(exp(est), fct_rev(alloc))) +
+  geom_vline(xintercept = 1, colour = pal[["grey"]]) +
+  geom_errorbarh(aes(xmin = exp(lo), xmax = exp(hi)), height = 0.15,
+                 colour = pal[["navy"]], linewidth = 1) +
+  geom_point(shape = 18, size = 7, colour = pal[["rust"]]) +
+  geom_text(aes(label = str_glue("k = {k}, I² = {fmt(i2, 0)}%")),
+            nudge_y = 0.3, colour = pal[["grey"]], size = 4.8) +
+  scale_x_log10() +
+  labs(x = "Pooled risk ratio (log scale)", y = "Method of allocation",
+       title = "Does the effect differ by how participants were allocated?",
+       subtitle = str_glue("Test for subgroup differences: p = {fmt(sub_test$QMp, 2)}"))
+```
+
+::: {.small}
+Pre-specify subgroups, keep them few, and compare them with a **formal interaction test**, not by eyeballing p-values.
+:::
+
+## Meta-regression: effect vs latitude
+
+:::: {.columns}
+::: {.column width="62%"}
+```{r}
+#| label: figx-metareg
+#| fig-width: 7
+#| fig-height: 5
+mr <- rma(yi, vi, mods = ~ ablat, data = bcg_es)
+
+line_df <- tibble(ablat = seq(10, 56, by = 1)) |>
+  mutate(fit = map(ablat, \(x) predict(mr, newmods = x) |> as_tibble())) |>
+  unnest(fit)
+
+bcg_es |>
+  ggplot(aes(ablat, exp(yi))) +
+  geom_hline(yintercept = 1, colour = pal[["grey"]], linetype = "dashed") +
+  geom_ribbon(data = line_df, aes(x = ablat, ymin = exp(ci.lb), ymax = exp(ci.ub)),
+              inherit.aes = FALSE, fill = pal[["rust"]], alpha = 0.15) +
+  geom_line(data = line_df, aes(ablat, exp(pred)), colour = pal[["rust"]], linewidth = 1.2) +
+  geom_point(aes(size = 1 / vi), shape = 21, fill = pal[["teal"]], colour = "white", alpha = 0.85) +
+  scale_y_log10() +
+  scale_size_continuous(range = c(2, 12), guide = "none") +
+  labs(x = "Absolute latitude of trial site (degrees)", y = "Risk ratio (log scale)")
+```
+:::
+::: {.column width="38%"}
+- Bubble size = study precision
+- Further from the equator, **more** protection
+- Latitude explains **`r fmt(mr$R2, 0)`%** of the between-study variance (*R*²)
+- Needs ~10 studies per covariate
+- Observational: **study-level** associations can mislead (ecological bias)
+:::
+::::
+
+## Sensitivity analysis: leave one out
+
+```{r}
+#| label: figx-loo
+#| fig-width: 11
+#| fig-height: 4.6
+loo <- leave1out(re) |>
+  as_tibble() |>
+  mutate(omitted = bcg_es$study) |>
+  mutate(omitted = fct_reorder(omitted, estimate))
+
+loo |>
+  ggplot(aes(exp(estimate), omitted)) +
+  annotate("rect", xmin = exp(re$ci.lb), xmax = exp(re$ci.ub), ymin = -Inf, ymax = Inf,
+           fill = pal[["rust"]], alpha = 0.08) +
+  geom_vline(xintercept = exp(re$b[1]), colour = pal[["rust"]]) +
+  geom_errorbarh(aes(xmin = exp(ci.lb), xmax = exp(ci.ub)), height = 0, colour = pal[["navy"]]) +
+  geom_point(colour = pal[["navy"]], size = 2.5) +
+  scale_x_log10() +
+  labs(x = "Pooled RR when this study is omitted", y = NULL,
+       subtitle = "Shaded band: 95% CI of the full analysis. No single trial drives the result.")
+```
+
+::: {.small}
+Also re-run excluding high risk-of-bias studies, using a different model, or a different effect measure.
+:::
+
+# Small-study effects {background-color="#12355B" .divider}
+
+## The funnel plot
+
+:::: {.columns}
+::: {.column width="58%"}
+```{r}
+#| label: figx-funnel
+#| fig-width: 6.6
+#| fig-height: 5.2
+se_max <- max(bcg_es$sei) * 1.1
+funnel_lines <- tibble(se = seq(0, se_max, length.out = 100)) |>
+  mutate(lo = re$b[1] - 1.96 * se, hi = re$b[1] + 1.96 * se)
+
+bcg_es |>
+  ggplot(aes(yi, sei)) +
+  geom_polygon(
+    data = bind_rows(
+      funnel_lines |> transmute(x = lo, y = se),
+      funnel_lines |> arrange(desc(se)) |> transmute(x = hi, y = se)
+    ),
+    aes(x, y), fill = pal[["soft"]], colour = pal[["grey"]], linetype = "dashed"
+  ) +
+  geom_vline(xintercept = re$b[1], colour = pal[["rust"]]) +
+  geom_point(size = 3.5, colour = pal[["navy"]]) +
+  scale_y_reverse() +
+  labs(x = "log risk ratio", y = "Standard error",
+       subtitle = "Dot = trial; shaded = 95% pseudo-CI region")
+```
+:::
+::: {.column width="42%"}
+- Large studies sit at the **top**, near the pooled effect
+- Small studies scatter more widely at the **bottom**
+- **Asymmetry** (a missing corner) suggests small-study effects, e.g. publication bias
+- But asymmetry also arises from heterogeneity, chance or poor quality
+- Need **≥ 10 studies** to interpret
+:::
+::::
+
+## Testing and adjusting for asymmetry
+
+```{r}
+#| label: pubbias
+egger <- regtest(re)
+tf <- trimfill(re)
+```
+
+| Method | What it does | BCG result |
+|---|---|---|
+| **Egger's test** | Regresses effect on its SE; slope ≠ 0 signals asymmetry | p = `r fmt(egger$pval, 2)` |
+| Begg's test | Rank correlation version | Lower power |
+| **Trim-and-fill** | Imputes "missing" studies to make the funnel symmetric | `r tf$k0` study added; RR `r fmt(exp(coef(re)))` → `r fmt(exp(coef(tf)))` |
+
+::: {.keybox}
+These are **sensitivity analyses**, not corrections. Searching trial registries and grey literature does more to prevent publication bias than any test.
+:::
+
+# Certainty of evidence: GRADE {background-color="#12355B" .divider}
+
+## From pooled estimate to recommendation
+
+RCTs start at **High**, observational studies at **Low**; final rating: **High · Moderate · Low · Very low**.
+
+:::: {.columns}
+::: {.column width="50%"}
+**Rate down** for
+
+1. **Risk of bias**
+2. **Inconsistency** (heterogeneity, *I*²)
+3. **Indirectness** (PICO mismatch)
+4. **Imprecision** (wide CI, few events)
+5. **Publication bias**
+:::
+::: {.column width="50%"}
+**Rate up** (mainly observational) for
+
+1. **Large magnitude** of effect
+2. **Dose–response** gradient
+3. **Plausible confounding** would reduce the effect
+:::
+::::
+
+::: {.keybox .small}
+Present the ratings, outcome by outcome, in a *Summary of Findings* table (GRADEpro).
+:::
+
+## Where meta-analysis meets GRADE
+
+```{r}
+#| label: tblx-grade
+tribble(
+  ~Domain,          ~`What the meta-analysis shows you`,                 ~BCG,
+  "Risk of bias",   "RoB judgements; sensitivity analysis by RoB",       "Some trials used alternation",
+  "Inconsistency",  "Forest plot overlap, I², τ², prediction interval", str_glue("I² = {fmt(re$I2, 0)}%: partly explained by latitude"),
+  "Indirectness",   "Do the studies match your PICO?",                   "Mixed populations and decades",
+  "Imprecision",    "Width of the pooled CI vs decision thresholds",     str_glue("CI {fmt(exp(re$ci.lb))} to {fmt(exp(re$ci.ub))}"),
+  "Publication bias","Funnel plot, Egger, trim-and-fill",                "No strong signal"
+) |>
+  knitr::kable()
+```
+
+::: {.small .muted}
+Illustrative only. A real GRADE assessment is done per outcome by the review team.
+:::
+
+# Doing it in R {background-color="#12355B" .divider}
+
+## A complete meta-analysis in a few lines
+
+```{r}
+#| label: code-full
+#| echo: true
+#| eval: false
+library(tidyverse)
+library(metafor)
+
+res <- dat.bcg |>
+  escalc(measure = "RR", ai = tpos, bi = tneg, ci = cpos, di = cneg,
+         data = _, slab = paste0(author, " (", year, ")")) |>
+  rma(yi, vi, data = _, method = "REML", test = "knha")   # random effects + HKSJ
+
+res                                 # pooled estimate, tau^2, I^2, Q
+predict(res, transf = exp)          # RR with CI and prediction interval
+forest(res, atransf = exp)          # forest plot
+funnel(res); regtest(res)           # funnel plot and Egger's test
+rma(yi, vi, mods = ~ ablat, data = res$data)   # meta-regression
+leave1out(res, transf = exp)        # sensitivity analysis
+```
+
+::: {.small}
+The **meta** package (`metabin()`, `metacont()`, `metagen()`) gives Cochrane-style output with the same ideas. See Schwarzer, Carpenter & Rücker, *Meta-Analysis with R* (Springer, 2015).
+:::
+
+## Software options
+
+| Tool | Strengths |
+|---|---|
+| **R: metafor, meta** | Free, reproducible, every method in this talk and more |
+| RevMan (Cochrane) | Standard for Cochrane reviews; GRADEpro integration |
+| Stata (`meta`) | Good built-in suite |
+| JASP / jamovi | Point-and-click front ends to metafor |
+| GRADEpro GDT | Summary of Findings tables and evidence profiles |
+
+## Common pitfalls
+
+- Pooling studies that answer **different questions**
+- Choosing fixed vs random **after** seeing *I*²
+- Treating *I*² as an absolute measure of heterogeneity (it depends on study precision)
+- Double-counting arms of multi-arm trials
+- Mixing change scores and final values with the SMD
+- Data-dredging through many unplanned subgroups
+- Ignoring risk of bias in the synthesis
+- Reporting a pooled estimate without a **prediction interval**
+
+## Take-home messages
+
+::: {.bigq}
+A meta-analysis is only as good as the systematic review behind it.
+:::
+
+1. Ask whether pooling makes sense **before** you pool
+2. Inverse-variance weighting: precise studies count for more
+3. Random effects estimates an **average**; report τ² and the prediction interval
+4. Heterogeneity is information: try to **explain** it
+5. Funnel plots and Egger's test are sensitivity checks, not proof
+6. Finish with **GRADE**: how sure are we?
+
+## Resources
+
+::: {.small}
+- *Cochrane Handbook for Systematic Reviews of Interventions*, v6.5: [training.cochrane.org/handbook](https://training.cochrane.org/handbook)
+- Schwarzer G, Carpenter JR, Rücker G. *Meta-Analysis with R*. Springer, 2015
+- Harrer M et al. *Doing Meta-Analysis with R: A Hands-On Guide*: [bookdown.org/MathiasHarrer/Doing_Meta_Analysis_in_R](https://bookdown.org/MathiasHarrer/Doing_Meta_Analysis_in_R/)
+- Viechtbauer W. metafor package: [metafor-project.org](https://www.metafor-project.org)
+- PRISMA 2020 statement: [prisma-statement.org](https://www.prisma-statement.org)
+- GRADE Learning Hub: [macgrade.mcmaster.ca](https://macgrade.mcmaster.ca/grade-learning-hub/grade-for-systematic-reviews/)
+- GRADEpro: [gradepro.org](https://www.gradepro.org)
+- Colditz GA et al. Efficacy of BCG vaccine in the prevention of tuberculosis. *JAMA* 1994;271:698–702
+:::
+
+# Thank you {background-color="#12355B" .divider}
+
+Questions?

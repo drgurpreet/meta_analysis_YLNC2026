@@ -1,0 +1,581 @@
+---
+title: "Meta-analysis in R: a worked example"
+subtitle: "BCG vaccine and tuberculosis: 13 randomised trials"
+author: "Dr Gurpreet"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    number-sections: true
+    code-fold: show
+    code-tools: true
+    embed-resources: true
+    df-print: kable
+    fig-width: 8
+    fig-height: 6
+execute:
+  warning: false
+  message: false
+---
+
+## Why this dataset?
+
+`dat.bcg` (Colditz et al., *Clin Infect Dis* 1994) ships with **metafor**. It has
+13 trials of BCG vaccination against tuberculosis, a binary outcome, and a lot
+of heterogeneity with a plausible explanation (distance from the equator). That
+makes it ideal for teaching every step: pooling, heterogeneity, small-study
+effects and sensitivity analysis.
+
+```{r}
+#| label: setup
+library(metafor)
+library(tidyverse)
+
+theme_set(theme_minimal(base_size = 12))
+
+# Helper: metafor output -> tibble with snake_case names (ci.lb -> ci_lb)
+tidy_mf <- \(x) x |>
+  as.data.frame() |>
+  as_tibble() |>
+  rename_with(\(nm) str_replace_all(nm, "\\.", "_"))
+```
+
+## The data
+
+```{r}
+#| label: data
+bcg <- dat.bcg |>
+  as_tibble() |>
+  mutate(
+    study  = str_c(author, ", ", year),
+    n_vacc = tpos + tneg,
+    n_ctrl = cpos + cneg
+  ) |>
+  select(trial, study, year, ablat, alloc,
+         tpos, n_vacc, cpos, n_ctrl, tneg, cneg)
+
+bcg |> select(study, ablat, alloc, tpos, n_vacc, cpos, n_ctrl)
+```
+
+`tpos`/`cpos` are TB cases in the vaccinated and control arms; `ablat` is the
+absolute latitude of the trial site.
+
+## Step 1: Effect size for each study
+
+`escalc()` computes the **log risk ratio** (`yi`) and its **sampling variance**
+(`vi`). We analyse on the log scale and back-transform for reporting.
+
+```{r}
+#| label: escalc
+bcg_es <- escalc(
+  measure = "RR",
+  ai = tpos, bi = tneg,   # vaccinated: events, non-events
+  ci = cpos, di = cneg,   # control:    events, non-events
+  data = bcg,
+  slab = study
+)
+
+bcg_es |>
+  as_tibble() |>
+  mutate(
+    rr    = exp(yi),
+    lower = exp(yi - 1.96 * sqrt(vi)),
+    upper = exp(yi + 1.96 * sqrt(vi))
+  ) |>
+  select(study, yi, vi, rr, lower, upper) |>
+  mutate(across(where(is.numeric), \(x) round(x, 3)))
+```
+
+## Step 2: Pool the studies
+
+```{r}
+#| label: models
+res_fe <- rma(yi, vi, data = bcg_es, method = "EE")    # common (fixed) effect
+res_re <- rma(yi, vi, data = bcg_es, method = "REML")  # random effects
+
+res_re
+```
+
+```{r}
+#| label: compare-models
+pooled <- bind_rows(
+  `Common effect`  = predict(res_fe, transf = exp) |> tidy_mf(),
+  `Random effects` = predict(res_re, transf = exp) |> tidy_mf(),
+  .id = "model"
+) |>
+  select(model, rr = pred, ci_lb, ci_ub, pi_lb, pi_ub)
+
+pooled |> mutate(across(where(is.numeric), \(x) round(x, 2)))
+```
+
+```{r}
+#| label: inline-numbers
+#| include: false
+re <- pooled |> filter(model == "Random effects")
+f2 <- \(x) format(round(x, 2), nsmall = 2)
+pct <- \(x) str_c(round(x, 1), "%")
+
+# Study weights (%) under each model, for the forest-plot discussion
+wts <- tibble(
+  study = bcg$study,
+  w_fe  = weights(res_fe),
+  w_re  = weights(res_re)
+)
+w_madras <- wts |> filter(str_detect(study, "Madras"))
+n_cross1 <- bcg_es |>
+  as_tibble() |>
+  filter(yi + 1.96 * sqrt(vi) > 0) |>
+  nrow()
+```
+
+::: {.callout-note}
+## Reading it
+Under the random-effects model, BCG vaccination is associated with a pooled
+RR of **`r f2(re$rr)`** (95% CI `r f2(re$ci_lb)` to `r f2(re$ci_ub)`), roughly
+a `r round(100 * (1 - re$rr))`% reduction in TB risk. The common-effect model
+gives a narrower and different answer because it ignores between-study
+variation. Here that assumption is clearly wrong (see Step 4).
+:::
+
+## Step 3: Forest plot
+
+```{r}
+#| label: fig-forest
+#| fig-cap: "Forest plot, random-effects model, with 95% prediction interval"
+#| fig-height: 7
+#| fig-width: 10
+forest(
+  res_re,
+  atransf   = exp,
+  at        = log(c(0.05, 0.25, 1, 4)),
+  xlim      = c(-16, 6),
+  ilab      = cbind(bcg$tpos, bcg$n_vacc, bcg$cpos, bcg$n_ctrl),
+  ilab.xpos = c(-9.5, -8, -6, -4.5),
+  header    = c("Study", "RR [95% CI]"),
+  addpred   = TRUE,
+  shade     = TRUE,
+  mlab      = "Random-effects model (REML)"
+)
+text(c(-9.5, -8, -6, -4.5), res_re$k + 2, c("TB+", "N", "TB+", "N"), font = 2, cex = 0.8)
+text(c(-8.75, -5.25),       res_re$k + 3, c("Vaccinated", "Control"), font = 2, cex = 0.8)
+```
+
+::: {.callout-tip}
+## How to read this plot
+* **Each row is one study.** The square is that study's RR; the horizontal
+  line is its 95% CI. An arrow means the CI runs off the scale.
+* **Square size = weight** in the pooled analysis. Big squares pull the
+  diamond towards themselves.
+* **Vertical line at RR = 1** is the line of no effect. Left of it favours
+  vaccination (fewer TB cases); right of it favours control.
+* **The diamond** is the pooled RR: its centre is the point estimate and its
+  width is the 95% CI.
+* **The dotted line through the diamond** is the 95% **prediction interval**:
+  the range in which the true effect of a *new* similar study is expected to
+  lie.
+* **The x-axis is logarithmic**, so RR 0.5 and RR 2 are equally far from 1.
+:::
+
+::: {.callout-note}
+## What we infer from it
+* **Direction:** `r res_re$k - 2` of `r res_re$k` trials lie left of 1; only
+  TPT Madras (RR 1.01) and Comstock & Webster (RR 1.56) do not.
+* **Precision varies:** `r n_cross1` trials have a CI that crosses 1 on their
+  own, yet the pooled diamond (`r f2(re$rr)`, `r f2(re$ci_lb)` to
+  `r f2(re$ci_ub)`) sits clearly left of 1. Pooling gives a precise answer
+  that no single small trial could.
+* **Visible heterogeneity (eyeball test):** many CIs do not overlap each other
+  (e.g. Hart & Sutherland 0.24 vs TPT Madras 1.01). Studies are not estimating
+  one common effect.
+* **Weights are fairly even** (`r f2(min(wts$w_re))`% to
+  `r f2(max(wts$w_re))`%) because τ² is large. Under a common-effect model
+  TPT Madras alone would carry `r f2(w_madras$w_fe)`% of the weight, versus
+  `r f2(w_madras$w_re)`% here.
+* **Prediction interval crosses 1** (`r f2(re$pi_lb)` to `r f2(re$pi_ub)`):
+  BCG works *on average*, but in some settings it may give little or no
+  protection. Report both the CI and the PI.
+:::
+
+## Step 4: Heterogeneity
+
+```{r}
+#| label: heterogeneity
+tibble(
+  statistic = c("Q", "df", "p (Q)", "tau^2", "tau", "I^2 (%)", "H^2"),
+  value     = c(res_re$QE, res_re$k - 1, res_re$QEp,
+                res_re$tau2, sqrt(res_re$tau2), res_re$I2, res_re$H2)
+) |>
+  mutate(value = if_else(statistic == "p (Q)",
+                         format.pval(value, eps = 1e-4),
+                         as.character(round(value, 2))))
+```
+
+Confidence intervals for the heterogeneity parameters:
+
+```{r}
+#| label: het-ci
+confint(res_re)
+```
+
+::: {.callout-important}
+## Reading it
+* **Q test**: rejects homogeneity (p < 0.0001), but it has low power with few
+  studies and too much power with many, so do not rely on it alone.
+* **I² = `r round(res_re$I2)`%**: the share of total variability due to real
+  differences between studies, not chance. It is a *proportion*, not an
+  absolute amount.
+* **τ² = `r f2(res_re$tau2)`**: the *absolute* between-study variance on the
+  log RR scale.
+* **Prediction interval `r f2(re$pi_lb)` to `r f2(re$pi_ub)`**: a new trial
+  in a new setting could plausibly find anything from a large benefit to no
+  benefit or even harm. This is often the most useful number for clinicians.
+:::
+
+### Explaining heterogeneity: meta-regression on latitude
+
+```{r}
+#| label: metareg
+res_mr <- rma(yi, vi, mods = ~ ablat, data = bcg_es, method = "REML")
+res_mr
+```
+
+```{r}
+#| label: fig-bubble
+#| fig-cap: "Bubble plot: BCG efficacy improves further from the equator"
+lat_grid <- tibble(ablat = seq(10, 60, by = 1))
+
+lat_pred <- predict(res_mr, newmods = lat_grid$ablat, transf = exp) |>
+  tidy_mf() |>
+  bind_cols(lat_grid)
+
+bcg_es |>
+  as_tibble() |>
+  mutate(rr = exp(yi), weight = 1 / vi) |>
+  ggplot(aes(ablat, rr)) +
+  geom_ribbon(data = lat_pred, aes(y = pred, ymin = ci_lb, ymax = ci_ub),
+              fill = "grey85") +
+  geom_line(data = lat_pred, aes(y = pred), linewidth = 0.8) +
+  geom_point(aes(size = weight), shape = 21, fill = "steelblue", alpha = 0.7) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  scale_y_log10() +
+  scale_size_area(max_size = 12, guide = "none") +
+  labs(x = "Absolute latitude (degrees)", y = "Risk ratio (log scale)",
+       subtitle = "Point size proportional to inverse-variance weight")
+```
+
+::: {.callout-tip}
+## How to read this plot
+* **Each bubble is one trial**, placed at its latitude (x) and its RR (y,
+  log scale). **Bubble size = weight** in the meta-regression.
+* **The solid line** is the fitted meta-regression; **the grey band** is its
+  95% CI.
+* **Dashed line at RR = 1** is no effect. Where the band sits below it, the
+  model predicts a protective effect.
+* A sloping line means the moderator explains part of the heterogeneity; a
+  flat line means it does not.
+:::
+
+::: {.callout-note}
+## What we infer from it
+* **Clear dose-response with latitude:** each extra degree from the equator
+  multiplies the RR by `r f2(exp(res_mr$b[2]))`, i.e. about
+  `r round(100 * (1 - exp(res_mr$b[2])), 1)`% more protection per degree
+  (p `r if (res_mr$QMp < 1e-4) "< 0.0001" else str_c("= ", f2(res_mr$QMp))`).
+* **Near the equator BCG shows little effect** (trials at 13-19°, such as TPT
+  Madras and Frimodt-Moller, sit near RR = 1). **Far from the equator it is
+  highly protective** (RR around 0.2-0.3 above 50°).
+* Latitude explains about **`r round(res_mr$R2)`%** of the between-study
+  variance (R²), and residual I² falls from `r round(res_re$I2)`% to
+  `r round(res_mr$I2)`%. Heterogeneity is largely *explained*, not just
+  noise.
+* **Caution:** this is an observational association *across* studies
+  (ecological). Latitude is a proxy for something else, plausibly prior
+  exposure to environmental mycobacteria. With 13 studies, one moderator is
+  the most the data can support (about 10 studies per covariate).
+:::
+
+## Step 5: Funnel plot
+
+```{r}
+#| label: fig-funnel
+#| fig-cap: "Funnel plot (left) and contour-enhanced funnel plot (right)"
+#| fig-width: 11
+#| fig-height: 5
+par(mfrow = c(1, 2))
+funnel(res_re, atransf = exp, xlab = "Risk ratio (log scale)")
+funnel(res_re, level = c(90, 95, 99),
+       shade = c("white", "grey80", "grey60"),
+       refline = 0, legend = TRUE,
+       atransf = exp, xlab = "Risk ratio (log scale)")
+par(mfrow = c(1, 1))
+```
+
+::: {.callout-tip}
+## How to read this plot
+* **x-axis:** each study's effect (RR, log scale). **y-axis:** its standard
+  error, *inverted*, so large precise studies are at the top and small
+  imprecise ones at the bottom.
+* **Vertical line:** the pooled estimate. **Triangle (left panel):** where
+  95% of studies should fall if there were no bias and no heterogeneity.
+* **Expected shape:** a symmetrical inverted funnel. Big studies cluster
+  tightly near the top; small studies scatter widely but *evenly on both
+  sides* at the bottom.
+* **Asymmetry** (a gap in one bottom corner) suggests small studies with
+  "unfavourable" results are missing.
+* **Contour-enhanced panel (right):** the reference line is RR = 1 and the
+  shading marks where results are statistically significant (grey zones:
+  p < 0.10, < 0.05, < 0.01). If the gap is in the white (non-significant)
+  zone, publication bias is a plausible cause. If it is in a significant
+  zone, look for other causes (heterogeneity, small-trial quality, chance).
+:::
+
+::: {.callout-note}
+## What we infer from it
+* **The large trials** (TPT Madras, Stein & Aronson, Comstock 1974, Hart &
+  Sutherland) sit at the top but are **spread widely left to right**. That
+  spread among precise studies is heterogeneity, not publication bias.
+* **Many points fall outside the triangle.** Expected when I² is
+  `r round(res_re$I2)`%: the triangle assumes a single common effect.
+* **Small trials at the bottom mostly lie to the left** (strong benefit), with
+  one on the right (Comstock & Webster, RR 1.56). There is only a mild hint of
+  asymmetry.
+* **In the contour panel**, the small trials sit in both shaded and white
+  zones, so there is no clear sign that non-significant studies are missing.
+* **Bottom line:** the visual impression is "some asymmetry, most likely
+  driven by heterogeneity (latitude)". We check this formally next.
+:::
+
+## Step 6: Egger's test and friends
+
+```{r}
+#| label: egger
+egger <- regtest(res_re, model = "lm", predictor = "sei")  # classic Egger
+egger
+```
+
+```{r}
+#| label: begg
+ranktest(res_re)
+```
+
+```{r}
+#| label: fig-trimfill
+#| fig-cap: "Trim-and-fill: imputed study shown as an open circle"
+res_tf <- trimfill(res_re)
+res_tf
+funnel(res_tf, atransf = exp, legend = TRUE, xlab = "Risk ratio (log scale)")
+```
+
+::: {.callout-warning}
+## Reading it
+**How to read the tests:** Egger's test regresses the effect on its standard
+error. A slope (here t = `r f2(egger$zval)`) significantly different from 0
+means small studies show systematically different results from large ones.
+Begg's test asks the same question with rank correlation. **How to read the
+trim-and-fill funnel:** open circles are the *imputed* "missing" studies,
+mirrored from the opposite side; the vertical line is the adjusted estimate.
+
+**What we infer:** Egger's test p = `r f2(egger$pval)` and Begg's test
+p = `r f2(ranktest(res_re)$pval)`: no strong evidence of small-study effects.
+Trim-and-fill imputes `r res_tf$k0` study on the `r res_tf$side` side (towards
+no effect) and moves the pooled RR only from `r f2(re$rr)` to
+`r f2(exp(res_tf$b[1]))` (95% CI `r f2(exp(res_tf$ci.lb))` to
+`r f2(exp(res_tf$ci.ub))`). The conclusion that BCG protects is unchanged.
+Remember:
+
+* With fewer than 10 studies, do not test for asymmetry (Cochrane Handbook).
+* Asymmetry ≠ publication bias. With I² this high, heterogeneity alone can
+  distort the funnel.
+* Trim-and-fill is a sensitivity analysis, not a correction.
+:::
+
+## Step 7: Leave-one-out sensitivity analysis
+
+```{r}
+#| label: loo
+loo <- leave1out(res_re, transf = exp) |>
+  tidy_mf() |>
+  mutate(study = bcg$study) |>
+  select(omitted = study, rr = estimate, ci_lb, ci_ub, I2, tau2)
+
+loo |> mutate(across(where(is.numeric), \(x) round(x, 2)))
+```
+
+```{r}
+#| label: fig-loo
+#| fig-cap: "Pooled RR after omitting each study in turn"
+pooled_rr <- exp(res_re$b[1])
+
+loo |>
+  mutate(omitted = fct_reorder(omitted, rr)) |>
+  ggplot(aes(rr, omitted)) +
+  annotate("rect", xmin = exp(res_re$ci.lb), xmax = exp(res_re$ci.ub),
+           ymin = -Inf, ymax = Inf, fill = "grey90") +
+  geom_vline(xintercept = pooled_rr, linetype = "dashed") +
+  geom_vline(xintercept = 1, colour = "firebrick") +
+  geom_pointrange(aes(xmin = ci_lb, xmax = ci_ub)) +
+  geom_text(aes(x = ci_ub, label = str_c("I² = ", round(I2), "%")),
+            hjust = -0.15, size = 3, colour = "grey30") +
+  scale_x_log10(breaks = c(0.3, 0.4, 0.5, 0.7, 1),
+                expand = expansion(mult = c(0.05, 0.25))) +
+  labs(x = "Pooled RR when study is omitted (log scale)", y = "Study omitted",
+       subtitle = "Dashed line and band = overall pooled RR and 95% CI")
+```
+
+::: {.callout-tip}
+## How to read this plot
+* **Each row is the meta-analysis re-run without one study** (named on the
+  y-axis). The dot is the new pooled RR and the line is its 95% CI.
+* **Dashed line and grey band:** the original pooled RR and CI with all
+  studies. **Red line:** RR = 1 (no effect).
+* **Rows are sorted** by the new pooled RR, so the top and bottom rows are the
+  studies whose removal moves the answer most.
+* **Labels on the right** show the I² after removal. A big drop marks a study
+  that contributes a lot of heterogeneity.
+* **What to look for:** does any omission push the estimate outside the grey
+  band, or make the CI cross the red line? If so, the result depends on that
+  one study.
+:::
+
+::: {.callout-note}
+## What we infer from it
+* Omitting any single trial moves the pooled RR only between
+  `r f2(min(loo$rr))` and `r f2(max(loo$rr))`. All dots stay inside the
+  original CI band and **every CI stays clear of 1**. The conclusion is
+  **robust** to any one study.
+* **TPT Madras** (largest trial, null result) is the most influential on the
+  *heterogeneity*: dropping it lowers I² to
+  `r round(loo$I2[str_detect(loo$omitted, "Madras")])`% and gives the most
+  favourable estimate (`r f2(loo$rr[str_detect(loo$omitted, "Madras")])`).
+* **Hart & Sutherland** (large, very protective) pulls the other way: dropping
+  it gives the least favourable estimate
+  (`r f2(loo$rr[str_detect(loo$omitted, "Hart")])`).
+* **I² stays above 85% whichever study is removed:** heterogeneity is not
+  caused by one outlier. It is a feature of the whole evidence base, which is
+  why the meta-regression on latitude matters.
+:::
+
+### Influence diagnostics
+
+```{r}
+#| label: fig-influence
+#| fig-cap: "Influence diagnostics (Viechtbauer & Cheung, 2010)"
+#| fig-height: 8
+inf_re <- influence(res_re)
+inf_re |> plot()
+```
+
+::: {.callout-tip}
+## How to read this plot
+Eight panels, one point per study (x-axis = study number, in the order of the
+forest plot):
+
+* **rstudent:** standardised residual. Values beyond ±2 to 3 mark outliers.
+* **dffits** and **cook.d:** how much the pooled estimate changes when the
+  study is removed. Large values mean influential.
+* **cov.r:** below 1 means removing the study makes the estimate *more*
+  precise.
+* **tau2.del** and **QE.del:** τ² and Q after removing the study. A big drop
+  marks a source of heterogeneity.
+* **hat** and **weight:** leverage and weight of each study.
+* **Red points** are studies flagged as influential by the combined rules of
+  Viechtbauer & Cheung (2010).
+:::
+
+::: {.callout-note}
+## What we infer from it
+* **`r sum(inf_re$is.infl)` studies are flagged as influential**; no residual
+  exceeds ±2.
+* The highest Cook's distances belong to **Hart & Sutherland**
+  (`r f2(inf_re$inf$cook.d[4])`) and **TPT Madras**
+  (`r f2(inf_re$inf$cook.d[8])`). These two also cause the largest drops in Q
+  (QE.del `r round(inf_re$inf$QE.del[4])` and
+  `r round(inf_re$inf$QE.del[8])` vs `r round(res_re$QE)` overall).
+* Together this agrees with leave-one-out: two large trials at opposite
+  extremes drive the heterogeneity, but neither alone changes the conclusion.
+:::
+
+```{r}
+#| label: fig-baujat
+#| fig-cap: "Baujat plot: contribution to heterogeneity (x) vs influence on the pooled result (y)"
+baujat(res_re)
+```
+
+::: {.callout-tip}
+## How to read this plot
+* **x-axis:** how much each study contributes to the overall heterogeneity
+  (its share of Cochran's Q).
+* **y-axis:** how much the pooled estimate changes when that study is
+  removed (influence on the result).
+* **Top-right corner** = studies that both add heterogeneity *and* move the
+  result. These deserve a closer look (population, design, risk of bias).
+* **Bottom-left** = studies that agree with the rest and have little
+  leverage.
+:::
+
+::: {.callout-note}
+## What we infer from it
+* **Hart & Sutherland (study 4)** and **TPT Madras (study 8)** sit in the
+  top-right: they are the main drivers of heterogeneity and of the pooled
+  estimate. They lie at opposite latitudes (52° vs 13°), which again points to
+  latitude as the explanation.
+* **Comstock & Webster, Vandiviere, Ferguson & Simes, Comstock 1976 and
+  Rosenthal 1961** add
+  heterogeneity but have moderate influence.
+* **Stein & Aronson and Aronson** sit near the origin: consistent with the
+  pooled result.
+:::
+
+## Summary for the slide
+
+```{r}
+#| label: summary
+tibble(
+  item = c("Studies (k)", "Pooled RR (RE, 95% CI)", "95% prediction interval",
+           "I²", "τ²", "Egger p", "Leave-one-out RR range"),
+  result = c(
+    res_re$k,
+    str_glue("{f2(re$rr)} ({f2(re$ci_lb)} to {f2(re$ci_ub)})"),
+    str_glue("{f2(re$pi_lb)} to {f2(re$pi_ub)}"),
+    str_c(round(res_re$I2), "%"),
+    f2(res_re$tau2),
+    f2(egger$pval),
+    str_glue("{f2(min(loo$rr))} to {f2(max(loo$rr))}")
+  )
+)
+```
+
+## Appendix: the same analysis with the **meta** package
+
+The *Meta-Analysis with R* book (Schwarzer, Carpenter & Rücker, 2015) uses
+**meta**. The equivalent calls are below (not run here).
+
+```{r}
+#| label: meta-pkg
+#| eval: false
+library(meta)
+
+m <- metabin(
+  event.e = tpos, n.e = n_vacc,
+  event.c = cpos, n.c = n_ctrl,
+  studlab = study, data = bcg,
+  sm = "RR", method.tau = "REML",
+  common = TRUE, random = TRUE, prediction = TRUE
+)
+
+summary(m)                                   # pooled RR, Q, I², τ²
+forest(m, sortvar = TE)                      # forest plot
+funnel(m, contour = c(0.9, 0.95, 0.99))      # contour-enhanced funnel
+metabias(m, method.bias = "Egger")           # Egger's test
+trimfill(m)                                  # trim-and-fill
+metainf(m, pooled = "random") |> forest()    # leave-one-out
+metareg(m, ~ ablat)                          # meta-regression
+```
+
+## Session info
+
+```{r}
+#| label: session
+sessionInfo()
+```

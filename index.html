@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Meta-Analysis: When and How</title>
+<style>
+  :root { --navy:#12355B; --rust:#C8553D; --ink:#1d2733; --muted:#6B7785; --bg:#ffffff; --card:#EEF3F7; }
+  body { margin:0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color:var(--ink); background:var(--bg); line-height:1.5; }
+  header { background:var(--navy); color:#fff; padding:48px 16px; }
+  .wrap { max-width:860px; margin:0 auto; padding:0 16px; }
+  h1 { margin:0 0 8px; font-size:2rem; }
+  header p { margin:0; opacity:.85; }
+  main { padding:32px 0 48px; }
+  .card { background:var(--card); border-radius:10px; padding:18px 20px; margin:0 0 16px; }
+  .card h2 { margin:0 0 6px; font-size:1.15rem; color:var(--navy); }
+  .card p { margin:0 0 10px; color:var(--muted); }
+  a.btn { display:inline-block; background:var(--rust); color:#fff; text-decoration:none; padding:6px 14px; border-radius:6px; margin-right:8px; }
+  a { color:var(--rust); }
+  footer { color:var(--muted); font-size:.9rem; padding:24px 0; border-top:1px solid #dde3ea; }
+</style>
+</head>
+<body>
+<header><div class="wrap">
+  <h1>Meta-Analysis: When and How</h1>
+  <p>Teaching material for the YLNC session · Department of Community Medicine, AFMC Pune</p>
+</div></header>
+<main><div class="wrap">
+  <div class="card">
+    <h2>Session slides</h2>
+    <p>The full deck: why and when to pool, effect measures, fixed vs random effects, heterogeneity, forest plots, meta-regression, small-study effects, GRADE and a worked example in R.</p>
+    <a class="btn" href="slides/meta_analysis_merged.html">Open slides</a>
+  </div>
+  <div class="card">
+    <h2>Worked example</h2>
+    <p>Step-by-step walkthrough with all code, using the 13 BCG vaccine trials (<code>metafor::dat.bcg</code>).</p>
+    <a class="btn" href="worked_example/meta_analysis_worked_example.html">Open worked example</a>
+    <a href="worked_example/meta_analysis_worked_example.R">Download .R</a>
+  </div>
+  <div class="card">
+    <h2>Hands-on script</h2>
+    <p>The R script used during the hands-on part of the session.</p>
+    <a href="slides/meta_analysis_handson.R">Download meta_analysis_handson.R</a>
+  </div>
+  <div class="card">
+    <h2>Earlier versions of the slides</h2>
+    <p><a href="slides/meta_analysis_ylnc.html">Concepts deck</a> · <a href="slides/meta_analysis_slides.html">Meta-analysis in R deck</a></p>
+  </div>
+  <footer>Run it yourself: <code>install.packages(c("tidyverse", "metafor", "patchwork"))</code>, then open either .R script in RStudio or Positron.</footer>
+</div></main>
+</body>
+</html>
